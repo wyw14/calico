@@ -317,6 +317,7 @@ func (t *TyphaDaemon) CreateServer() {
 		t.CachesBySyncerType,
 		syncserver.Config{
 			MaxMessageSize:                 t.ConfigParams.ServerMaxMessageSize,
+			MaxBacklogObjects:              t.ConfigParams.ServerMaxBacklogObjects,
 			MinBatchingAgeThreshold:        t.ConfigParams.ServerMinBatchingAgeThresholdSecs,
 			MaxFallBehind:                  t.ConfigParams.ServerMaxFallBehindSecs,
 			NewClientFallBehindGracePeriod: t.ConfigParams.ServerNewClientFallBehindGracePeriod,

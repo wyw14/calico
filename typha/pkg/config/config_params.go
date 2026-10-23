@@ -119,7 +119,10 @@ type Config struct {
 
 	SnapshotCacheMaxBatchSize int `config:"int(1,);100"`
 
-	ServerMaxMessageSize                 int           `config:"int(1,);100"`
+	ServerMaxMessageSize int `config:"int(1,);100"`
+	// ServerMaxBacklogObjects bounds the delta objects a slow client can owe before it is
+	// disconnected (it reconnects and takes a fresh snapshot); 0 falls back to the server default.
+	ServerMaxBacklogObjects              int           `config:"int(0,);100000"`
 	ServerMaxFallBehindSecs              time.Duration `config:"seconds;300"` //nolint:staticcheck // Ignore ST1011 don't use unit-specific suffix
 	ServerNewClientFallBehindGracePeriod time.Duration `config:"seconds;300"`
 	ServerMinBatchingAgeThresholdSecs    time.Duration `config:"seconds;0.01"` //nolint:staticcheck // Ignore ST1011 don't use unit-specific suffix

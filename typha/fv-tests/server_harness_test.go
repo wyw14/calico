@@ -177,11 +177,42 @@ func (h *ServerHarness) CreateNoOpClient(id any, syncType syncproto.SyncerType) 
 
 func (h *ServerHarness) CreateClient(id any, syncType syncproto.SyncerType) *ClientState {
 	recorder := NewRecorder()
-	c := h.createClient(id, syncclient.Options{SyncerType: syncType}, recorder)
+	c := h.createClientWithHostname(id, fmt.Sprintf("test-host-%v", id), syncclient.Options{SyncerType: syncType}, recorder)
 	c.recorder = recorder
 	go recorder.Loop(c.recorderCtx)
 	h.ClientStates = append(h.ClientStates, c)
 	return c
+}
+
+// CreateClientWithHostname creates a recording client that presents the
+// given hostname, so tests can reconnect (or collide) under a controlled
+// client ID.
+func (h *ServerHarness) CreateClientWithHostname(id any, hostname string, syncType syncproto.SyncerType) *ClientState {
+	recorder := NewRecorder()
+	c := h.createClientWithHostname(id, hostname, syncclient.Options{SyncerType: syncType}, recorder)
+	c.recorder = recorder
+	go recorder.Loop(c.recorderCtx)
+	h.ClientStates = append(h.ClientStates, c)
+	return c
+}
+
+// CreateClientWithCallbacks creates a client with arbitrary callbacks (for
+// example a callback that blocks to simulate a slow consumer).
+func (h *ServerHarness) CreateClientWithCallbacks(id any, hostname string, options syncclient.Options, callbacks api.SyncerCallbacks) *ClientState {
+	c := h.createClientWithHostname(id, hostname, options, callbacks)
+	h.ClientStates = append(h.ClientStates, c)
+	return c
+}
+
+// ClientFinished returns a channel that is closed when the client's
+// background goroutines have all exited.
+func (h *ServerHarness) ClientFinished(c *ClientState) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		c.client.Finished.Wait()
+		close(done)
+	}()
+	return done
 }
 
 func (h *ServerHarness) CreateClientWithOptions(id any, opts syncclient.Options) *ClientState {
@@ -224,10 +255,14 @@ func (h *ServerHarness) ExpectAllClientsToReachState(status api.SyncStatus, kvs 
 }
 
 func (h *ServerHarness) createClient(id any, options syncclient.Options, callbacks api.SyncerCallbacks) *ClientState {
+	return h.createClientWithHostname(id, fmt.Sprintf("test-host-%v", id), options, callbacks)
+}
+
+func (h *ServerHarness) createClientWithHostname(id any, hostname string, options syncclient.Options, callbacks api.SyncerCallbacks) *ClientState {
 	client := syncclient.New(
 		discovery.New(discovery.WithAddrOverride(h.Addr())),
 		"test-version",
-		fmt.Sprintf("test-host-%v", id),
+		hostname,
 		"test-info",
 		callbacks,
 		&options,
@@ -336,6 +371,20 @@ func (h *ServerHarness) SendConfigUpdates(n int) map[string]api.Update {
 		h.Decoupler.OnUpdates([]api.Update{update})
 	}
 	return expectedEndState
+}
+
+// SendConfigDeletion deletes the named global config key at the given
+// revision.  It does not update an expected-state map because that depends on
+// the test's initial state.
+func (h *ServerHarness) SendConfigDeletion(name, revision string) {
+	update := api.Update{
+		KVPair: model.KVPair{
+			Key:      model.GlobalConfigKey{Name: name},
+			Revision: revision,
+		},
+		UpdateType: api.UpdateTypeKVDeleted,
+	}
+	h.Decoupler.OnUpdates([]api.Update{update})
 }
 
 func (h *ServerHarness) Discoverer() *discovery.Discoverer {

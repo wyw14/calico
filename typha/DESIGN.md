@@ -66,6 +66,30 @@ uncompressed).
   what a misbehaving peer can make the other side do. The server never
   decompresses client data, and it caps each inbound message at 1MiB.
 
+## Per-client watermarks and backlog bound
+
+Each handshaked connection is registered in a watermark
+monitor (in `libcalico-go/lib/backend/syncwatermark`) under the
+client's hostname, carrying the revision it has been sent up to
+(breadcrumb `HighWaterRevision`), the number of delta objects it
+owes, and the reason its previous connection ended
+(client-closed, write-failed, pong-timeout, fell-behind,
+backlog-overflow, superseded, server-shutdown). The first
+detected cause wins; a reconnect by the same hostname while an
+older connection is still alive supersedes the old one, which is
+canceled before the new snapshot is sent.
+
+The snapshot+delta protocol is the backpressure boundary: when a
+client has fallen behind in time and the coalesced delta log
+exceeds `MaxBacklogObjects`, or the write fails with that much
+work already queued, Typha drops the connection. The client
+reconnects and starts from a complete fresh snapshot, which is
+sent to completion before deltas resume, so stale deltas can
+never be interleaved with the new view. On the consumer side, the
+Felix calc layer bounds the queue feeding the graph
+(`BoundedSyncCallbacks`); once it is full the Typha client blocks
+on the socket, which is what makes the server-side bound engage.
+
 ## Gaps
 
 This doc is currently a stub apart from the compression section.

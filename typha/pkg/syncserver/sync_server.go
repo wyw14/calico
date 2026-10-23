@@ -35,6 +35,7 @@ import (
 
 	calicotls "github.com/projectcalico/calico/crypto/pkg/tls"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/syncwatermark"
 	"github.com/projectcalico/calico/libcalico-go/lib/health"
 	cprometheus "github.com/projectcalico/calico/libcalico-go/lib/prometheus"
 	"github.com/projectcalico/calico/libcalico-go/lib/writelogger"
@@ -79,6 +80,18 @@ var (
 		Help: "Total number of connections that made use of the grace period to catch up after sending the initial " +
 			"snapshot.",
 	}, []string{"syncer"})
+	counterVecClientDisconnects = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "typha_client_disconnects_total",
+		Help: "Total number of client connections that ended, by the reason recorded for the disconnect.",
+	}, []string{"syncer", "reason"})
+	gaugeVecClientSentRevision = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "typha_client_sent_revision",
+		Help: "Highest datastore revision reached by any streaming client for this syncer.",
+	}, []string{"syncer"})
+	gaugeVecClientBacklog = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "typha_client_backlog_objects_total",
+		Help: "Total number of delta objects outstanding across all streaming clients for this syncer.",
+	}, []string{"syncer"})
 
 	// allCompressionMetricAlgorithms lists every algorithm value used for
 	// the "compression" metric label, including CompressionNone (reported
@@ -101,6 +114,16 @@ func init() {
 	}
 	prometheus.MustRegister(counterVecGracePeriodUsed)
 	promutils.PreCreateCounterPerSyncer(counterVecGracePeriodUsed)
+	prometheus.MustRegister(counterVecClientDisconnects)
+	for _, st := range syncproto.AllSyncerTypes {
+		gaugeVecClientSentRevision.WithLabelValues(string(st))
+		gaugeVecClientBacklog.WithLabelValues(string(st))
+		for _, reason := range syncwatermark.AllDisconnectReasons {
+			counterVecClientDisconnects.WithLabelValues(string(st), string(reason))
+		}
+	}
+	prometheus.MustRegister(gaugeVecClientSentRevision)
+	prometheus.MustRegister(gaugeVecClientBacklog)
 }
 
 const (
@@ -108,6 +131,12 @@ const (
 	defaultMaxMessageSize                 = 100
 	defaultMaxFallBehind                  = 300 * time.Second
 	defaultNewClientFallBehindGracePeriod = 300 * time.Second
+	// defaultMaxBacklogObjects bounds the number of delta objects a slow
+	// client is allowed to owe.  Past it the connection is dropped so the
+	// client reconnects with a fresh snapshot instead of receiving an
+	// unbounded (and increasingly stale) delta log.  Initial snapshots do
+	// not count against the bound.
+	defaultMaxBacklogObjects = 100000
 
 	// maxInboundMessageBytes is the maximum number of bytes we'll read from a
 	// client for a single gob message. Client messages (MsgClientHello, MsgPong,
@@ -145,6 +174,11 @@ type Server struct {
 
 	perSyncerConnMetrics map[syncproto.SyncerType]perSyncerConnMetrics
 
+	// watermarkMon records, per client ID, the revision the connection has
+	// sent up to, how many delta objects it still owes and why its previous
+	// connection ended.
+	watermarkMon *syncwatermark.Monitor
+
 	Finished sync.WaitGroup
 }
 
@@ -161,6 +195,7 @@ type Config struct {
 	Host                           string
 	Port                           int
 	MaxMessageSize                 int
+	MaxBacklogObjects              int
 	BinarySnapshotTimeout          time.Duration
 	MaxFallBehind                  time.Duration
 	NewClientFallBehindGracePeriod time.Duration
@@ -197,6 +232,7 @@ func (c Config) LogFields() log.Fields {
 		"host":                               c.Host,
 		"port":                               c.Port,
 		"maxMessageSize":                     c.MaxMessageSize,
+		"maxBacklogObjects":                  c.MaxBacklogObjects,
 		"binarySnapshotTimeout":              c.BinarySnapshotTimeout,
 		"maxFallBehind":                      c.MaxFallBehind,
 		"newClientFallBehindGracePeriod":     c.NewClientFallBehindGracePeriod,
@@ -234,6 +270,13 @@ func (c *Config) ApplyDefaults() {
 			"default": defaultMaxMessageSize,
 		}).Info("Defaulting MaxMessageSize.")
 		c.MaxMessageSize = defaultMaxMessageSize
+	}
+	if c.MaxBacklogObjects < 1 {
+		log.WithFields(log.Fields{
+			"value":   c.MaxBacklogObjects,
+			"default": defaultMaxBacklogObjects,
+		}).Info("Defaulting MaxBacklogObjects.")
+		c.MaxBacklogObjects = defaultMaxBacklogObjects
 	}
 	if c.MaxFallBehind <= 0 {
 		log.WithFields(log.Fields{
@@ -392,6 +435,7 @@ func New(caches map[syncproto.SyncerType]BreadcrumbProvider, config Config) *Ser
 		connIDToConn:         map[uint64]*connection{},
 		listeningC:           make(chan struct{}),
 		perSyncerConnMetrics: map[syncproto.SyncerType]perSyncerConnMetrics{},
+		watermarkMon:         syncwatermark.NewMonitor(),
 	}
 
 	// Only create snapshot caches for algorithms that are in the server's
@@ -566,6 +610,7 @@ func (s *Server) serve(cxt context.Context) {
 		connection := &connection{
 			ID:              connID,
 			config:          &s.config,
+			server:          s,
 			allCaches:       s.caches,
 			allSnapshotters: s.binSnapCaches,
 			cxt:             connCxt,
@@ -630,6 +675,20 @@ func (s *Server) discardConnection(conn *connection) {
 	s.lock.Lock()
 	delete(s.connIDToConn, conn.ID)
 	s.lock.Unlock()
+}
+
+// WatermarkMonitor returns the monitor that tracks each client's sent
+// revision, outstanding delta count and last disconnect/reconnect reason.
+func (s *Server) WatermarkMonitor() *syncwatermark.Monitor {
+	return s.watermarkMon
+}
+
+// connectionByID returns the active connection with the given ID, or nil if
+// it has already been removed.
+func (s *Server) connectionByID(connID uint64) *connection {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	return s.connIDToConn[connID]
 }
 
 func (s *Server) governNumberOfConnections(cxt context.Context) {
@@ -777,6 +836,18 @@ func (s *Server) ShutDownGracefully() {
 type connection struct {
 	ID     uint64
 	config *Config
+	server *Server
+
+	// clientID identifies the client across connections (its hostname); it
+	// is populated during the handshake.
+	clientID string
+	// wm is this connection's handle into the server's watermark monitor.
+	// It is unset for connections that fail before completing the handshake.
+	wm syncwatermark.Conn
+	// disconnectReason is set when a goroutine finds the root cause for a
+	// disconnect; the first cause wins.
+	disconnectReasonMu sync.Mutex
+	disconnectReason   syncwatermark.DisconnectReason
 
 	// cxt is the per-connection context.
 	cxt context.Context
@@ -850,7 +921,16 @@ func (h *connection) handle(finishedWG *sync.WaitGroup) (err error) {
 			_ = h.writer.Close()
 		}
 		gaugeNumConnections.Dec()
-		h.logCxt.Info("Client connection shut down.")
+		// All background goroutines have stopped, so the disconnect cause
+		// they may have recorded has settled; record it on the client's
+		// watermark.  A superseded connection was already recorded at
+		// Connect time, so Disconnect is a no-op in that case.
+		reason := h.effectiveDisconnectReason()
+		if h.wm.Disconnect(reason) {
+			counterVecClientDisconnects.WithLabelValues(string(h.syncerType), string(reason)).Inc()
+		}
+		h.refreshWatermarkGauges()
+		h.logCxt.WithField("reason", reason).Info("Client connection shut down.")
 		finishedWG.Done()
 	}()
 
@@ -870,6 +950,7 @@ func (h *connection) handle(finishedWG *sync.WaitGroup) (err error) {
 
 	// Now do the (synchronous) handshake.
 	if err = h.doHandshake(); err != nil {
+		h.noteDisconnectReason(syncwatermark.ReasonHandshakeFailed)
 		return // Error already logged.
 	}
 	h.gaugeNumConnectionsStreaming.Inc()
@@ -885,6 +966,7 @@ func (h *connection) handle(finishedWG *sync.WaitGroup) (err error) {
 			// passes the handshake.
 			h.logCxt.WithField("algorithm", h.chosenCompression).Error(
 				"No snapshot cache for negotiated compression algorithm.")
+			h.noteDisconnectReason(syncwatermark.ReasonHandshakeFailed)
 			err = ErrNoSnapshotCache
 			return
 		}
@@ -900,6 +982,7 @@ func (h *connection) handle(finishedWG *sync.WaitGroup) (err error) {
 			err = h.sendDecoderRestartAndWaitForAck(reason)
 			if err != nil {
 				log.WithError(err).Info("Failed to restart encoding after handshake, tearing down connection.")
+				h.noteDisconnectReason(syncwatermark.ReasonWriteFailed)
 				return
 			}
 		}
@@ -913,6 +996,7 @@ func (h *connection) handle(finishedWG *sync.WaitGroup) (err error) {
 		breadcrumb, err = binSnapCache.SendSnapshot(h.cxt, h.connW, h.conn)
 		if err != nil {
 			log.WithError(err).Info("Failed to send snapshot to client, tearing down connection.")
+			h.noteDisconnectReason(syncwatermark.ReasonWriteFailed)
 			return
 		}
 		// SendSnapshot manages the connection's write deadline itself and
@@ -926,6 +1010,7 @@ func (h *connection) handle(finishedWG *sync.WaitGroup) (err error) {
 		err = h.waitForAckAndRestartEncoder()
 		if err != nil {
 			log.WithError(err).Info("Failed to restart encoding after snapshot, tearing down connection.")
+			h.noteDisconnectReason(syncwatermark.ReasonWriteFailed)
 			return
 		}
 		h.logCxt.Info("Sent compressed binary snapshot and received ACK from client.")
@@ -938,9 +1023,15 @@ func (h *connection) handle(finishedWG *sync.WaitGroup) (err error) {
 		err = h.streamSnapshotToClient(h.logCxt, breadcrumb)
 		if err != nil {
 			log.WithError(err).Info("Failed to send snapshot to client, tearing down connection.")
+			h.noteDisconnectReason(syncwatermark.ReasonWriteFailed)
 			return
 		}
 	}
+
+	// The snapshot is the client's authoritative starting point; record the
+	// revision it brought the client to before any delta is sent.
+	h.wm.SnapshotSent(breadcrumb.HighWaterRevision, breadcrumb.SequenceNumber)
+	h.refreshWatermarkGauges()
 
 	// Start a goroutine to stream deltas to the client.
 	h.shutDownWG.Add(1)
@@ -966,6 +1057,9 @@ func (h *connection) handle(finishedWG *sync.WaitGroup) (err error) {
 		case msg := <-h.readC:
 			if msg == nil {
 				h.logCxt.Info("Read channel ended")
+				// readFromClient attributes client-side closes itself; if the
+				// channel ended because we canceled the context, the default
+				// classification (server shutdown) applies.
 				return h.cxt.Err()
 			}
 			switch msg := msg.(type) {
@@ -975,6 +1069,7 @@ func (h *connection) handle(finishedWG *sync.WaitGroup) (err error) {
 				h.summaryPingLatency.Observe(time.Since(msg.PingTimestamp).Seconds())
 			default:
 				h.logCxt.WithField("msg", msg).Error("Unknown message from client")
+				h.noteDisconnectReason(syncwatermark.ReasonClientClosed)
 				return errors.New("unknown message type")
 			}
 		case <-pongTicker.C:
@@ -984,6 +1079,7 @@ func (h *connection) handle(finishedWG *sync.WaitGroup) (err error) {
 					"pongTimeout":       h.config.PongTimeout,
 					"timeSinceLastPong": since,
 				}).Info("Too long since last pong from client, disconnecting")
+				h.noteDisconnectReason(syncwatermark.ReasonPongTimeout)
 				return errors.New("no pong received from client")
 			}
 		case <-h.cxt.Done():
@@ -1009,15 +1105,22 @@ func (h *connection) readFromClient(logCxt *log.Entry) {
 		var envelope syncproto.Envelope
 		err := r.Decode(&envelope)
 		if err != nil {
-			if errors.Is(err, io.EOF) {
-				logCxt.Info("Client closed the connection.")
-			} else {
-				logCxt.WithError(err).Info("Failed to read from client")
+			// If our own context was canceled first (server shutdown or
+			// this connection was superseded), the read error is a
+			// consequence, not the cause; leave the recorded reason alone.
+			if h.cxt.Err() == nil {
+				if errors.Is(err, io.EOF) {
+					logCxt.Info("Client closed the connection.")
+				} else {
+					logCxt.WithError(err).Info("Failed to read from client")
+				}
+				h.noteDisconnectReason(syncwatermark.ReasonClientClosed)
 			}
 			break
 		}
 		if envelope.Message == nil {
 			log.Error("nil message from client")
+			h.noteDisconnectReason(syncwatermark.ReasonClientClosed)
 			break
 		}
 		select {
@@ -1107,6 +1210,29 @@ func (h *connection) doHandshake() error {
 		return ErrUnsupportedClientFeature
 	}
 	h.cache = desiredSyncerCache
+
+	// Register this connection against the client's watermark record.  If
+	// the client already has an open connection (a reconnect after a
+	// network partition, for example), the old connection is recorded as
+	// superseded and torn down before this connection sends its snapshot,
+	// so the two streams can never interleave on the client.
+	clientID := hello.Hostname
+	if clientID == "" {
+		clientID = fmt.Sprintf("client-%d", h.ID)
+	}
+	h.clientID = clientID
+	h.logCxt = h.logCxt.WithField("clientID", clientID)
+	wmConn, oldConnID, superseded := h.server.watermarkMon.Connect(clientID, string(syncerType), h.ID)
+	h.wm = wmConn
+	if superseded {
+		h.logCxt.WithField("oldConnID", oldConnID).Info("Superseding previous connection for client")
+		if old := h.server.connectionByID(oldConnID); old != nil {
+			old.noteDisconnectReason(syncwatermark.ReasonSuperseded)
+			counterVecClientDisconnects.WithLabelValues(
+				string(old.syncerType), string(syncwatermark.ReasonSuperseded)).Inc()
+			old.cancelCxt()
+		}
+	}
 
 	clientSupportedCompressionAlgorithms := make(map[syncproto.CompressionAlgorithm]bool, len(hello.SupportedCompressionAlgorithms))
 	for _, alg := range hello.SupportedCompressionAlgorithms {
@@ -1272,6 +1398,42 @@ func (h *connection) maybeResetWriteTimeout() error {
 	return nil
 }
 
+// noteDisconnectReason records why this connection is ending.  The first
+// recorded cause wins because it is the root cause; later goroutines only
+// observe the consequences.
+func (h *connection) noteDisconnectReason(reason syncwatermark.DisconnectReason) {
+	h.disconnectReasonMu.Lock()
+	defer h.disconnectReasonMu.Unlock()
+	if h.disconnectReason == "" {
+		h.disconnectReason = reason
+	}
+}
+
+// effectiveDisconnectReason returns the recorded cause, classifying an
+// unlabeled exit as server shutdown (context canceled) or client-closed.
+func (h *connection) effectiveDisconnectReason() syncwatermark.DisconnectReason {
+	h.disconnectReasonMu.Lock()
+	reason := h.disconnectReason
+	h.disconnectReasonMu.Unlock()
+	if reason != "" {
+		return reason
+	}
+	if h.cxt.Err() != nil {
+		return syncwatermark.ReasonServerShutdown
+	}
+	return syncwatermark.ReasonClientClosed
+}
+
+// refreshWatermarkGauges publishes the syncer-wide watermark aggregates.
+func (h *connection) refreshWatermarkGauges() {
+	if h.server == nil || h.syncerType == "" {
+		return
+	}
+	agg := h.server.watermarkMon.Aggregate(string(h.syncerType))
+	gaugeVecClientSentRevision.WithLabelValues(string(h.syncerType)).Set(float64(agg.MaxSentRevision))
+	gaugeVecClientBacklog.WithLabelValues(string(h.syncerType)).Set(float64(agg.BacklogObjects))
+}
+
 // sendDeltaUpdatesToClient follows the breadcrumbs from the given one, sending delta updates from each
 // subsequent breadcrumb to the client.  It does not send the deltas from the given breadcrumb (it assumes
 // that breadcrumb was sent to the client already as the snapshot).
@@ -1307,14 +1469,24 @@ func (h *connection) sendDeltaUpdatesToClient(logCxt *log.Entry, breadcrumb *sna
 
 	// The first Breadcrumb may have changed the status.  Send an update if so.
 	if err := maybeSendStatus(); err != nil {
+		h.noteDisconnectReason(syncwatermark.ReasonWriteFailed)
 		return
 	}
 
 	loggedClientBehind := false
+	// pendingDeltaCount is the number of delta objects the client has not
+	// yet been sent since it last caught up.  It bounds the catch-up work we
+	// do for a slow client: past MaxBacklogObjects we drop the connection so
+	// it reconnects and takes a fresh snapshot instead of streaming an
+	// ever-growing delta log.  The initial snapshot is never counted.
+	var pendingDeltaCount int
 	for h.cxt.Err() == nil {
 		// Wait for new Breadcrumbs.  If we're behind, we'll coalesce the deltas from multiple Breadcrumbs
 		// before exiting the loop.
-		var deltas []syncproto.SerializedUpdate
+		var (
+			deltas    []syncproto.SerializedUpdate
+			lastCrumb *snapcache.Breadcrumb
+		)
 		for len(deltas) < h.config.MaxMessageSize {
 			// Get the next breadcrumb.  This may block.
 			nextStartTime := time.Now()
@@ -1324,6 +1496,7 @@ func (h *connection) sendDeltaUpdatesToClient(logCxt *log.Entry, breadcrumb *sna
 				logCxt.WithError(err).Info("Getting next Breadcrumb canceled by context.")
 				return
 			}
+			lastCrumb = breadcrumb
 			timeSpentInNext := time.Since(nextStartTime)
 
 			// Take a peek at the very latest breadcrumb to see how far behind we are...
@@ -1354,6 +1527,7 @@ func (h *connection) sendDeltaUpdatesToClient(logCxt *log.Entry, breadcrumb *sna
 						"latestSeqNo":    latestCrumb.SequenceNumber,
 						"mySnapshotSize": breadcrumb.KVs.Len(),
 					}).Warn("Client fell behind. Disconnecting.")
+					h.noteDisconnectReason(syncwatermark.ReasonFellBehind)
 					return
 				} else if !loggedClientBehind {
 					logCxt.WithFields(log.Fields{
@@ -1378,9 +1552,35 @@ func (h *connection) sendDeltaUpdatesToClient(logCxt *log.Entry, breadcrumb *sna
 				loggedClientBehind = false // Avoid logging the "caught up" log on every loop.
 			}
 
-			if crumbAge < h.config.MinBatchingAgeThreshold && deltas == nil {
-				// We're not behind and we haven't already started to batch up updates.  Avoid
-				// copying the deltas and just send them
+			pendingDeltaCount += len(breadcrumb.Deltas)
+			// Only apply the object bound to a client that is already behind
+			// in time; a fresh burst (all breadcrumbs younger than the
+			// batching threshold) is drained immediately below, so bounding it
+			// would penalise healthy clients.  A write that stalls with a
+			// large batch in flight is attributed to the backlog bound on
+			// failure, see below.
+			if crumbAge >= h.config.MinBatchingAgeThreshold && pendingDeltaCount > h.config.MaxBacklogObjects {
+				// The client cannot catch up within the object bound.  Tear the
+				// connection down; on reconnect it starts from a fresh snapshot,
+				// which is sent to completion before deltas resume, so stale
+				// deltas cannot be interleaved with the new view.
+				logCxt.WithFields(log.Fields{
+					"backlog":        pendingDeltaCount,
+					"maxBacklog":     h.config.MaxBacklogObjects,
+					"mySeqNo":        breadcrumb.SequenceNumber,
+					"latestSeqNo":    latestCrumb.SequenceNumber,
+					"mySnapshotSize": breadcrumb.KVs.Len(),
+				}).Warn("Client delta backlog exceeds bound; disconnecting so it reconnects with a fresh snapshot.")
+				h.noteDisconnectReason(syncwatermark.ReasonBacklogOverflow)
+				return
+			}
+
+			if crumbAge < h.config.MinBatchingAgeThreshold && deltas == nil && breadcrumb.TryNext() == nil {
+				// Not behind, no batch started and no further breadcrumb is
+				// already queued; send the deltas straight away.  A ready
+				// successor means the client is trailing even on a fresh
+				// timestamp, so fall through to coalesce it (and enforce the
+				// backlog bound) instead.
 				deltas = breadcrumb.Deltas
 				break
 			}
@@ -1397,20 +1597,43 @@ func (h *connection) sendDeltaUpdatesToClient(logCxt *log.Entry, breadcrumb *sna
 		}
 
 		if len(deltas) > 0 {
+			backlogAtSend := pendingDeltaCount
+			pendingDeltaCount -= len(deltas)
 			// Send the deltas relative to the previous snapshot.
 			logCxt.WithField("num", len(deltas)).Debug("Sending deltas")
 			h.summaryNumKVsPerMsg.Observe(float64(len(deltas)))
+			h.summaryBacklogObjects.Observe(float64(backlogAtSend))
 			err := h.sendMsg(syncproto.MsgKVs{
 				KVs: deltas,
 			})
 			if err != nil {
-				logCxt.WithError(err).Info("Failed to send to client.")
+				// The batch we were sending plus every breadcrumb already
+				// linked behind it is work the client has not drained; the
+				// write failing with that total over the bound means a slow
+				// client, so the reconnect snapshot is the remedy.
+				outstanding := backlogAtSend
+				for peek := lastCrumb.TryNext(); peek != nil; peek = peek.TryNext() {
+					outstanding += len(peek.Deltas)
+				}
+				if outstanding > h.config.MaxBacklogObjects {
+					logCxt.WithError(err).WithFields(log.Fields{
+						"backlog":    outstanding,
+						"maxBacklog": h.config.MaxBacklogObjects,
+					}).Info("Failed to send to slow client with over-bound backlog.")
+					h.noteDisconnectReason(syncwatermark.ReasonBacklogOverflow)
+				} else {
+					logCxt.WithError(err).Info("Failed to send to client.")
+					h.noteDisconnectReason(syncwatermark.ReasonWriteFailed)
+				}
 				return
 			}
+			h.wm.DeltasSent(lastCrumb.HighWaterRevision, lastCrumb.SequenceNumber, pendingDeltaCount)
+			h.refreshWatermarkGauges()
 		}
 
 		// Newest breadcrumb may have updated the sync status, send an update if so.
 		if err := maybeSendStatus(); err != nil {
+			h.noteDisconnectReason(syncwatermark.ReasonWriteFailed)
 			return
 		}
 	}
@@ -1515,6 +1738,7 @@ func (h *connection) sendPingsToClient(logCxt *log.Entry) {
 			})
 			if err != nil {
 				log.WithError(err).Info("Failed to send ping to client")
+				h.noteDisconnectReason(syncwatermark.ReasonWriteFailed)
 				return
 			}
 		case <-h.cxt.Done():
@@ -1534,6 +1758,7 @@ type perSyncerConnMetrics struct {
 	summaryNextCatchupLatency prometheus.Summary
 	summaryPingLatency        prometheus.Summary
 	summaryNumKVsPerMsg       prometheus.Summary
+	summaryBacklogObjects     prometheus.Summary
 }
 
 func makePerSyncerConnMetrics(syncerType syncproto.SyncerType) perSyncerConnMetrics {
@@ -1572,6 +1797,11 @@ func makePerSyncerConnMetrics(syncerType syncproto.SyncerType) perSyncerConnMetr
 	c.summaryNumKVsPerMsg = promutils.GetOrRegister(cprometheus.NewSummary(prometheus.SummaryOpts{
 		Name:        "typha_kvs_per_msg",
 		Help:        "Number of KV pairs sent in each message.",
+		ConstLabels: syncerLabels,
+	}))
+	c.summaryBacklogObjects = promutils.GetOrRegister(cprometheus.NewSummary(prometheus.SummaryOpts{
+		Name:        "typha_client_backlog_objects",
+		Help:        "Number of delta objects a client still had outstanding when it sent a batch.",
 		ConstLabels: syncerLabels,
 	}))
 	c.counterGracePeriodUsed = counterVecGracePeriodUsed.WithLabelValues(string(syncerType))

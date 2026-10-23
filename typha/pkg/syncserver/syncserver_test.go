@@ -37,6 +37,7 @@ var _ = Describe("With zero config", func() {
 			BinarySnapshotTimeout:          time.Second,
 			WriteTimeout:                   120 * time.Second,
 			MaxMessageSize:                 100,
+			MaxBacklogObjects:              100000,
 			MaxFallBehind:                  300 * time.Second,
 			NewClientFallBehindGracePeriod: 300 * time.Second,
 			MinBatchingAgeThreshold:        100 * time.Millisecond,

@@ -27,6 +27,7 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/syncwatermark"
 	"github.com/projectcalico/calico/libcalico-go/lib/health"
 	cprometheus "github.com/projectcalico/calico/libcalico-go/lib/prometheus"
 	"github.com/projectcalico/calico/typha/pkg/jitter"
@@ -408,7 +409,8 @@ func (c *Cache) publishBreadcrumb() {
 		somethingChanged = true
 		newCrumb.SyncStatus = c.pendingStatus
 	}
-	// Update the main trie and record the updates in the new crumb.
+	// Update the master trie and record the updates in the new crumb.
+	var batchHighWater uint64
 	for _, upd := range updates {
 		// Update stats.
 		c.counterUpdatesTotal.Inc()
@@ -448,6 +450,11 @@ func (c *Cache) publishBreadcrumb() {
 		// Record the update in the new Breadcrumb so that clients following the chain of
 		// Breadcrumbs can apply it as a delta.
 		newCrumb.Deltas = append(newCrumb.Deltas, newUpd)
+		if rev, ok := syncwatermark.ParseRevision(newUpd.Revision); ok {
+			batchHighWater = max(batchHighWater, rev.Value())
+		} else if rev, ok := syncwatermark.ParseRevision(newUpd.V3ResourceVersion); ok {
+			batchHighWater = max(batchHighWater, rev.Value())
+		}
 		somethingChanged = true
 	}
 
@@ -461,6 +468,9 @@ func (c *Cache) publishBreadcrumb() {
 	}
 
 	c.gaugeSnapSize.Set(float64(c.kvs.Len()))
+	// Carry the revision watermark forward over the chain; a status-only
+	// breadcrumb keeps the previous revision.
+	newCrumb.HighWaterRevision = max(oldCrumb.HighWaterRevision, batchHighWater)
 	// Add the new read-only snapshot to the new crumb.
 	newCrumb.KVs = c.kvs.Clone()
 
@@ -487,6 +497,13 @@ type Breadcrumb struct {
 	KVs        *btree.BTreeG[syncproto.SerializedUpdate]
 	Deltas     []syncproto.SerializedUpdate
 	SyncStatus api.SyncStatus
+
+	// HighWaterRevision is the highest datastore revision this breadcrumb
+	// reflects.  It is carried forward over the chain so a client can record
+	// one revision watermark after a snapshot or after any later batch of
+	// deltas.  Deletions advance it because a delete is itself a revisioned
+	// datastore event.
+	HighWaterRevision uint64
 
 	nextCond *sync.Cond
 	next     unsafe.Pointer
@@ -524,4 +541,12 @@ func (b *Breadcrumb) Next(ctx context.Context) (*Breadcrumb, error) {
 // loadNext does an atomic load of the next pointer.  It returns nil or the next Breadcrumb.
 func (b *Breadcrumb) loadNext() *Breadcrumb {
 	return (*Breadcrumb)(atomic.LoadPointer(&b.next))
+}
+
+// TryNext returns the next breadcrumb without blocking if one is not
+// available yet (nil otherwise).  It lets a sender measure how many ready
+// breadcrumbs a slow client is trailing without parking on the condition
+// variable.
+func (b *Breadcrumb) TryNext() *Breadcrumb {
+	return b.loadNext()
 }
