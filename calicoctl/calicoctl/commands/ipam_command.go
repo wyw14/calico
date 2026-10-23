@@ -48,6 +48,7 @@ configuration.`,
 		newIPAMShowCommand(),
 		newIPAMSplitCommand(),
 		newIPAMConfigureCommand(),
+		newIPAMPlanCommand(),
 	)
 	return cmd
 }
@@ -311,5 +312,67 @@ maximum number of blocks per host.`,
 	cmd.Flags().String("max-blocks-per-host", "", "Set the maximum number of blocks that can be affine to a host.")
 	cmd.Flags().String("kubevirt-ip-persistence", "", "Control whether KubeVirt VMs retain persistent IP addresses (Enabled|Disabled).")
 	cmd.Flags().Int("ip-cooldown-seconds", -1, "Set the minimum time between release and re-allocation of an IP address.")
+	return cmd
+}
+
+func newIPAMPlanCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "plan",
+		Short: "Plan IP address capacity without changing allocations",
+		Long: `Read a demand file describing the additional IPv4/IPv6 addresses
+expected per node and namespace, and simulate how Calico IPAM would satisfy
+that demand from the current datastore snapshot.
+
+The plan honors IP pool node/namespace selectors, allowed uses, automatic
+assignment mode and the per-node block limit, and it deducts addresses that
+are already allocated, reserved (IPReservations) or in release cooldown.
+It reports how many addresses can be satisfied, which blocks would have to
+be newly claimed, and why any demand cannot be met.
+
+The command is read-only: it creates no blocks, claims no affinity and
+changes no allocations. Results are tied to the resource versions read at
+the time and are only valid for that snapshot.
+
+Strict affinity must be enabled, because borrowing cannot be planned.
+
+The demand file is YAML or JSON, for example:
+
+  demands:
+    - node: node-a
+      namespace: default
+      ipv4: 30
+      ipv6: 30
+    - node: node-b
+      namespace: team-a
+      ipv4: 200
+`,
+		Example: `  # Plan capacity from a demand file.
+  calicoctl ipam plan --demand demands.yaml
+
+  # Also write a machine-readable JSON report.
+  calicoctl ipam plan --demand demands.yaml -o plan.json`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			config, _ := cmd.Flags().GetString("config")
+			demandPath, _ := cmd.Flags().GetString("demand")
+			use, _ := cmd.Flags().GetString("use")
+			output, _ := cmd.Flags().GetString("output")
+			kubeconfig, _ := cmd.Flags().GetString("kubeconfig")
+			allowMismatch, _ := cmd.Flags().GetBool("allow-version-mismatch")
+
+			if err := common.CheckVersionMismatch(config, allowMismatch); err != nil {
+				return err
+			}
+			if demandPath == "" {
+				return fmt.Errorf("--demand is required: path to a YAML/JSON file of node/namespace address demand")
+			}
+
+			return ipam.PlanIPAM(context.Background(), config, demandPath, use, output, kubeconfig)
+		},
+	}
+	addConfigFlag(cmd)
+	cmd.Flags().String("demand", "", "Path to a YAML/JSON file of additional IPv4/IPv6 address demand per node and namespace.")
+	cmd.Flags().String("use", "Workload", "Intended use of the planned addresses (Workload or Tunnel).")
+	cmd.Flags().StringP("output", "o", "", "Path to write a machine-readable JSON plan report.")
+	cmd.Flags().String("kubeconfig", "", "Path to Kubeconfig file (used for namespace labels when not using the Kubernetes datastore).")
 	return cmd
 }
