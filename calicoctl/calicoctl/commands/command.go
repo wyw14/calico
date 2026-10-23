@@ -106,6 +106,7 @@ node instance.`,
 	// Router commands.
 	cmd.AddCommand(
 		newIPAMCommand(),
+		newNetworkSetCommand(),
 		newNodeCommand(),
 		newDatastoreCommand(),
 		newClusterCommand(),

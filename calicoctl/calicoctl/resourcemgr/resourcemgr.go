@@ -498,15 +498,16 @@ func CreateResourcesFromFile(f string) ([]runtime.Object, error) {
 	// Load the bytes from file or from stdin.
 	logCxt := log.WithField("source", f)
 	var reader io.Reader
-	var err error
 	if f == "-" {
 		reader = os.Stdin
 	} else {
-		reader, err = os.Open(f)
+		file, err := os.Open(f)
 		if err != nil {
 			logCxt.WithError(err).Error("Failed to open file")
 			return nil, err
 		}
+		defer file.Close()
+		reader = file
 	}
 
 	logCxt.Debug("Creating document separator")
