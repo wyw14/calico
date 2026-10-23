@@ -55,11 +55,19 @@ func Validate(selector string) (err error) {
 func NewParser() *Parser {
 	return &Parser{
 		tokBuf: make([]tokenizer.Token, 0, 128),
+		offBuf: make([]int, 0, 128),
+		limits: DefaultComplexityLimits(),
 	}
 }
 
 type Parser struct {
 	tokBuf []tokenizer.Token
+	// offBuf is reused to hold token byte offsets while computing the
+	// static-complexity report.
+	offBuf []int
+	// limits bounds selector complexity; checked before building the
+	// AST.
+	limits ComplexityLimits
 }
 
 func (p *Parser) Parse(selector string) (sel *Selector, err error) {
@@ -87,6 +95,13 @@ func (p *Parser) parseRoot(selector string, validateOnly bool) (sel *Selector, e
 	if cap(tokens) > cap(p.tokBuf) && cap(tokens) < 4096 {
 		// Allow buffer to grow if we're seeing large inputs.
 		p.tokBuf = tokens[:0]
+	}
+
+	// Check static complexity (nesting depth, pattern count, estimated
+	// index cost) before recursing into the parser.  Over-limit inputs
+	// fail here with a locatable error; legal selectors are unaffected.
+	if _, err = p.analyzeTokens(selector, tokens); err != nil {
+		return
 	}
 
 	var node Node

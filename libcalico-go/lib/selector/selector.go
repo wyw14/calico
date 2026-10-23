@@ -54,6 +54,26 @@ func Validate(selector string) (err error) {
 	return parser.Validate(selector)
 }
 
+// ComplexityReport summarises the static complexity of a selector.  See
+// parser.ComplexityReport for details.
+type ComplexityReport = parser.ComplexityReport
+
+// ComplexityLimits configures the static-complexity checks applied when
+// parsing selectors.
+type ComplexityLimits = parser.ComplexityLimits
+
+// LimitExceededError reports a static-complexity limit violation together
+// with the location of the offending token.
+type LimitExceededError = parser.LimitExceededError
+
+// AnalyzeComplexity reports static complexity metrics for a selector
+// (nesting depth, pattern-matcher count and estimated label-index cost)
+// without building an AST.  An error is returned if the selector is
+// syntactically invalid or exceeds the default complexity limits.
+func AnalyzeComplexity(selector string) (ComplexityReport, error) {
+	return parser.AnalyzeComplexity(selector)
+}
+
 // Normalise converts the given selector to the form returned by
 // Selector.String(), i.e. "" is converted to "all()" and whitespace is
 // tidied up.  If the input string cannot be parsed, it is returned unaltered.

@@ -281,3 +281,61 @@ var _ = Describe("Token", func() {
 		}
 	}
 })
+
+var tokenOffsetTests = []struct {
+	input   string
+	offsets []int
+}{
+	{`a=="b"`, []int{0, 1, 3, 6}},
+	{`( a == "b" )`, []int{0, 2, 4, 7, 11, 12}},
+	{`a starts  with "x"`, []int{0, 2, 15, 18}},
+	{`a not in "x"`, []int{0, 2, 9, 12}},
+	{`a notin"x"`, []int{0, 2, 7, 10}},
+	{`has( foo )`, []int{0, 10}},
+	{`all( )`, []int{0, 6}},
+	{`global( )`, []int{0, 9}},
+	{`a == "x\y"`, []int{0, 2, 5, 10}},
+	// Multibyte content is inside a string literal; offsets stay byte based.
+	{`a == "世界"`, []int{0, 2, 5, 13}},
+	// IPv4-shaped label names.
+	{`10.0.0.1 == 'x'`, []int{0, 9, 12, 15}},
+	// Trailing whitespace: EOF is reported at end of input.
+	{`a == "b"  `, []int{0, 2, 5, 10}},
+}
+
+var _ = Describe("TokenOffsets", func() {
+	for _, test := range tokenOffsetTests {
+		test := test
+		It(fmt.Sprintf("should locate each token of %#v", test.input), func() {
+			tokens, err := tokenizer.Tokenize(test.input)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(tokens).To(HaveLen(len(test.offsets)))
+			offsets := tokenizer.TokenOffsets(test.input, tokens)
+			Expect(offsets).To(Equal(test.offsets))
+
+			// The token must actually start at its reported offset.
+			for i, tok := range tokens[:len(tokens)-1] {
+				off := offsets[i]
+				Expect(off).To(BeNumerically(">=", 0))
+				Expect(off).To(BeNumerically("<", len(test.input)))
+				switch tok.Kind {
+				case tokenizer.TokLabel:
+					Expect(test.input[off : off+len(tok.Value)]).To(Equal(tok.Value))
+				case tokenizer.TokHas:
+					Expect(test.input[off : off+len("has(")]).To(Equal("has("))
+					Expect(test.input).To(ContainSubstring(tok.Value))
+				case tokenizer.TokStringLiteral:
+					Expect(test.input[off]).To(BeElementOf(byte('"'), byte('\'')))
+				}
+			}
+			Expect(offsets[len(offsets)-1]).To(Equal(len(test.input)))
+		})
+	}
+
+	It("should work when appending to an existing offsets slice", func() {
+		tokens, err := tokenizer.Tokenize(`a == "b"`)
+		Expect(err).NotTo(HaveOccurred())
+		offsets := tokenizer.AppendTokenOffsets([]int{-1}, `a == "b"`, tokens)
+		Expect(offsets).To(Equal([]int{-1, 0, 2, 5, 8}))
+	})
+})
